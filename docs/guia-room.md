@@ -20,6 +20,17 @@ El flujo de datos sigue un patrón unireccional desacoplado:
                  (SQLite DB)                          (Servidor REST)
 ```
 
+### ¿Por qué esta arquitectura?
+
+Separar el proyecto en capas (`domain`, `data`, `ui`, `di`) no es una formalidad: cada capa resuelve un problema concreto y, al aislarlas, un cambio en una no obliga a tocar las demás.
+
+- **`domain`**: es el "centro" de la app. Define *qué* es un contacto y *qué* se puede hacer con él, sin saber si los datos vienen de SQLite, de una API o de un archivo. Así, si mañana cambias Room por otra base de datos, esta capa no se entera.
+- **`data`**: es el "cómo". Sabe hablar con Room (`local`) y con Retrofit (`remote`), y sabe traducir esos formatos técnicos al modelo de dominio (`mapper`). El `repository` de esta capa es quien decide, en la práctica, de dónde sale la información que ve el usuario.
+- **`ui`**: es la "cara visible". Solo le importa mostrar datos y reaccionar a acciones del usuario (escribir, tocar un botón). No sabe ni le importa si detrás hay Room, Retrofit o ambos.
+- **`di`**: es el "pegamento". Como cada capa depende de interfaces (no de implementaciones concretas) para no acoplarse, algo tiene que decidir *qué implementación real* se usa en cada caso; eso lo hace Hilt a través de estos módulos.
+
+El flujo de datos es unidireccional: la UI nunca escribe directamente en la base de datos ni llama a la API; todo pasa por el ViewModel → Repository → (Room y/o Retrofit). Esto hace que, sin importar de dónde vengan los datos, la UI siempre reciba la misma forma de información (`Flow<List<Contact>>`) y se actualice sola cuando esos datos cambian.
+
 La estructura de paquetes sugerida en `com.rojas.consumodatos` es:
 
 ```text
@@ -56,6 +67,10 @@ com.rojas.consumodatos/
 
 ## 📝 2. Paso 1: Modelo de Dominio (`domain/model/Contact.kt`)
 
+**¿Por qué existe este archivo?** Porque Room necesita anotaciones (`@Entity`, `@PrimaryKey`) y Retrofit/Gson necesitan las suyas (`@SerializedName`), pero el resto de la app (ViewModel, UI) no debería depender de ninguna de esas librerías. `Contact` es la representación "neutral" del concepto de negocio: un contacto tiene `id`, `name` y `phone`, punto. Es el tipo que viaja por `domain/repository`, `ViewModel` y `Screen`.
+
+**Qué sentido tiene crearlo:** si en el futuro cambias Room por otra librería de persistencia, o Retrofit por otro cliente HTTP, esta clase no cambia, y por lo tanto el ViewModel y la UI tampoco. Es el desacople entre "cómo se guardan/transportan los datos" y "qué son los datos para el negocio".
+
 Crea la clase de modelo de dominio pura. Esta clase no tiene anotaciones de Room ni de Retrofit:
 
 ```kotlin
@@ -72,7 +87,13 @@ data class Contact(
 
 ## 💾 3. Paso 2: Capa Local con Room (`data/local`)
 
+Esta subcarpeta concentra todo lo que sabe hablar con **SQLite a través de Room**: la tabla (`ContactEntity`), las consultas (`ContactDao`), el contenedor de la base de datos (`AppDatabase`) y una capa fina que oculta el DAO al resto de la app (`ContactLocalDataSource`). Nada fuera de `data/local` debería importar clases de Room directamente.
+
 ### A. Entidad Room (`ContactEntity.kt`)
+**Por qué existe:** Room necesita una clase anotada para saber cómo crear y leer la tabla SQL. `@Entity(tableName = "contacts")` le dice "crea una tabla llamada `contacts`" y cada propiedad se vuelve una columna. `@PrimaryKey(autoGenerate = true)` delega en SQLite la generación del `id`, para no tener que inventarlo a mano.
+
+**Por qué no es lo mismo que `Contact` (domain):** porque si mañana cambias un detalle de la tabla (por ejemplo, agregar una columna interna de auditoría), no quieres que ese detalle "se filtre" al resto de la app. `ContactEntity` es la representación de la fila en SQLite; `Contact` es el concepto de negocio.
+
 Representa la estructura de la tabla `contacts` en SQLite:
 
 ```kotlin
@@ -91,6 +112,18 @@ data class ContactEntity(
 ```
 
 ### B. Interface DAO (`ContactDao.kt`)
+**Por qué existe:** el DAO (*Data Access Object*) es el único lugar del proyecto donde se escribe SQL. Room genera automáticamente la implementación de esta interfaz a partir de las anotaciones (`@Query`, `@Insert`, `@Query` para `DELETE`), así que nunca escribes el código que ejecuta esas consultas, solo la firma.
+
+**Qué sentido tiene:** que `getAllContacts()` devuelva `Flow<List<ContactEntity>>` (en vez de una lista simple) significa que Room **emite un nuevo valor automáticamente cada vez que la tabla cambia**. Eso es lo que permite que, más adelante, el ViewModel "escuche" la tabla y la UI se actualice sola sin tener que refrescar manualmente.
+
+**¿Qué es `Flow` exactamente?** Es un flujo de datos asíncrono de Kotlin: en vez de pedir un valor una sola vez (como hace una función `suspend fun getContacts(): List<Contact>`), un `Flow` representa **una secuencia de valores en el tiempo** a la que alguien se "suscribe" con `.collect { ... }`. Pensarlo como una especie de "radio" al que te sintonizas: no pides un dato puntual, sino que te quedas escuchando y te avisan cada vez que hay uno nuevo.
+
+Aplicado a `getAllContacts(): Flow<List<ContactEntity>>`:
+- Es un flujo **frío** (*cold*): no hace nada hasta que alguien lo colecciona (en este proyecto, el `ContactViewModel` en `observeContacts()`).
+- Room se encarga de **emitir una nueva lista completa cada vez que la tabla `contacts` cambia** (un `INSERT` o `DELETE`), sin que nadie tenga que pedirlo explícitamente ni volver a ejecutar la consulta a mano.
+- Se cancela solo: cuando el que está coleccionando desaparece (por ejemplo, la pantalla se cierra y `viewModelScope` se cancela), Room deja de emitir y libera los recursos.
+- Es la base de que toda la cadena Room → Repository → ViewModel → Compose sea **reactiva**: un cambio en SQLite se propaga solo hasta la UI, sin botones de "refrescar" ni *polling*.
+
 Define las operaciones de base de datos. Retorna `Flow` para observación reactiva:
 
 ```kotlin
@@ -119,6 +152,8 @@ interface ContactDao {
 ```
 
 ### C. Base de Datos Room (`AppDatabase.kt`)
+**Por qué existe:** es el punto único de acceso a la base de datos física. `@Database(entities = [...], version = 1)` le dice a Room qué tablas debe crear y en qué versión de esquema está la base; `abstract fun contactDao()` expone el DAO para que Hilt pueda inyectarlo en otros lugares. Solo debe existir **una instancia** de esta clase en toda la app (por eso más adelante se inyecta como `@Singleton`).
+
 ```kotlin
 package com.rojas.consumodatos.data.local
 
@@ -132,6 +167,15 @@ abstract class AppDatabase : RoomDatabase() {
 ```
 
 ### D. Fuente de Datos Local (`ContactLocalDataSource.kt`)
+**¿Por qué existe si ya tenemos el DAO?** Esta es la pregunta obligada, porque en este proyecto `ContactLocalDataSourceImpl` solo **delega 1:1** cada método al `ContactDao` — no agrega ninguna lógica propia. La razón de que exista igual no es técnica sino de **desacoplamiento de capas**:
+
+- El `ContactDao` es una interfaz de **Room**: sus tipos, anotaciones (`@Dao`, `@Query`, `@Insert`) y semántica solo tienen sentido porque Room las entiende. Si el `Repository` inyectara el DAO directamente, quedaría atado a Room.
+- El `ContactLocalDataSource` es una interfaz **neutral**: dice "la fuente de datos local sabe `getContacts()`, `saveContact()`, etc.", sin mencionar Room para nada. La implementación (`ContactLocalDataSourceImpl`) es la *única* clase que conoce al DAO; todo lo demás (Repository, ViewModel, UI) ni se entera de que existe.
+- En pruebas, se puede reemplazar `ContactLocalDataSource` por una implementación falsa sin tocar Room ni el dispositivo, al testear el Repository o el ViewModel de forma aislada.
+- Si el día de mañana cambias Room por otra librería de persistencia, o agregas una segunda fuente local (por ejemplo, un cache en memoria), el cambio queda contenido en esta capa: el Repository no se entera.
+
+**Siendo honestos:** en un proyecto de este tamaño, con un solo DAO y sin planes de cambiar de librería, esta capa hoy es principalmente *boilerplate* — no evita ningún bug ni agrega comportamiento. Es una decisión de **Clean Architecture por consistencia y escalabilidad a futuro**, no una necesidad técnica inmediata. Si el proyecto fuera a quedarse siempre así de simple, se podría inyectar el `ContactDao` directamente en el Repository sin perder nada hoy; la ventaja de mantener el `DataSource` aparece recién cuando el proyecto crece (más fuentes de datos, más pruebas, cambios de librería).
+
 Abstrae las llamadas directas al DAO:
 
 ```kotlin
@@ -161,7 +205,12 @@ class ContactLocalDataSourceImpl @Inject constructor(
 
 ## 🌐 4. Paso 3: Capa Remota con Retrofit y OkHttp (`data/remote`)
 
+Igual que `data/local` concentra todo lo relacionado a Room, `data/remote` concentra todo lo relacionado a hablar con el servidor REST: el formato del JSON (`ContactDto`), el contrato HTTP (`ContactApiService`) y una capa fina que lo esconde del resto de la app (`ContactRemoteDataSource`).
+
 ### A. DTO Red (`ContactDto.kt`)
+**Por qué existe:** un DTO (*Data Transfer Object*) representa el JSON tal cual lo entrega o espera la API, que casi nunca coincide 1:1 con el modelo de dominio (nombres de campo distintos, campos opcionales, campos que la app ignora). `@SerializedName` le dice a Gson cómo mapear cada campo del JSON a esta clase.
+
+**Por qué no reutilizar `Contact` directamente:** porque si la API cambia el nombre de un campo o agrega uno nuevo, no quieres que ese cambio obligue a tocar el ViewModel o la UI. El DTO absorbe esos cambios; el dominio queda intacto.
 ```kotlin
 package com.rojas.consumodatos.data.remote
 
@@ -175,6 +224,7 @@ data class ContactDto(
 ```
 
 ### B. Servicio API Retrofit (`ContactApiService.kt`)
+**Por qué existe:** es el contrato HTTP declarado como interfaz; Retrofit genera la implementación real (las llamadas de red) a partir de las anotaciones (`@GET`, `@POST`, `@Body`). Así nunca escribes a mano el código que arma la petición HTTP, solo describes el endpoint.
 ```kotlin
 package com.rojas.consumodatos.data.remote
 
@@ -192,6 +242,7 @@ interface ContactApiService {
 ```
 
 ### C. Fuente de Datos Remota (`ContactRemoteDataSource.kt`)
+**Por qué existe:** mismo motivo que `ContactLocalDataSource`, pero para la red: el `Repository` depende de la interfaz `ContactRemoteDataSource` ("la fuente de datos remota"), no de Retrofit directamente. Esto permite, por ejemplo, reemplazar Retrofit por otro cliente HTTP sin tocar el repositorio, o simularla en pruebas.
 ```kotlin
 package com.rojas.consumodatos.data.remote
 
@@ -214,6 +265,10 @@ class ContactRemoteDataSourceImpl @Inject constructor(
 
 ## 🔄 5. Paso 4: Mapeadores de Datos (`data/mapper/ContactMapper.kt`)
 
+**Por qué existe:** ahora hay tres representaciones del mismo "contacto" (`ContactEntity` para Room, `ContactDto` para la red, `Contact` para el resto de la app) y alguien tiene que traducir entre ellas. Si esa traducción se hiciera dentro del DAO, del ApiService o del ViewModel, cada capa terminaría conociendo los detalles de las otras, rompiendo el desacople que se buscó al separarlas.
+
+**Qué sentido tiene:** al ser funciones de extensión puras (`ContactEntity.toDomain()`, `Contact.toEntity()`, etc.), son fáciles de testear de forma aislada y concentran en un solo archivo toda la lógica de conversión. El `Repository` es el único que las usa.
+
 Funciones de extensión para convertir modelos entre capas sin acoplarlas:
 
 ```kotlin
@@ -233,7 +288,10 @@ fun Contact.toDto() = ContactDto(id = if (id == 0L) null else id, name = name, p
 
 ## 🏢 6. Paso 5: Capa Repositorio (`domain/repository` y `data/repository`)
 
+El Repositorio es la pieza que decide, en la práctica, **de dónde viene la verdad**: aquí viven las reglas como "la UI siempre lee de Room" y "la red solo se usa para sincronizar/escribir", combinando `ContactLocalDataSource` y `ContactRemoteDataSource` detrás de una única API simple para el resto de la app (el patrón *Single Source of Truth*).
+
 ### A. Interfaz del Repositorio (`domain/repository/ContactRepository.kt`)
+**Por qué está en `domain` y no en `data`:** porque el ViewModel (capa de presentación) solo debería depender de *qué* operaciones de negocio existen (`getContacts`, `addContact`, `syncRemoteContacts`, `deleteContact`), no de *cómo* están implementadas. Al vivir la interfaz en `domain`, el ViewModel puede ignorar por completo que detrás hay Room y Retrofit.
 ```kotlin
 package com.rojas.consumodatos.domain.repository
 
@@ -249,6 +307,8 @@ interface ContactRepository {
 ```
 
 ### B. Implementación (`data/repository/ContactRepositoryImpl.kt`)
+**Cómo interactúa con las capas anteriores:** recibe por constructor (inyectadas por Hilt) las dos fuentes de datos. `getContacts()` siempre lee de `localDataSource` y la convierte con el mapper — por eso la UI "ve" los datos de SQLite, no los de la red directamente. `syncRemoteContacts()` es la única operación que toca la red: descarga los contactos remotos y los **guarda en Room**; la UI se entera de ese cambio automáticamente porque sigue observando el mismo `Flow` de la base de datos local. Así, Room actúa como caché/fuente única y la red solo "alimenta" esa caché.
+
 ```kotlin
 package com.rojas.consumodatos.data.repository
 
@@ -296,7 +356,10 @@ class ContactRepositoryImpl @Inject constructor(
 
 ## 💉 7. Paso 6: Inversión e Inyección de Dependencias (`di`)
 
+Hasta aquí, casi todas las clases dependen de **interfaces** (`ContactLocalDataSource`, `ContactRemoteDataSource`, `ContactRepository`) y no de implementaciones concretas. Eso es intencional (Inversión de Dependencias), pero en algún lugar hay que decirle al sistema **qué implementación real usar** cuando algo pide, por ejemplo, un `ContactRepository`. Ese "algún lugar" son los módulos de Hilt en `di`: cada uno agrupa las dependencias de un área (base de datos, red, repositorios) y Hilt arma automáticamente el grafo de objetos, evitando que cada clase tenga que crear sus propias dependencias a mano (`new`/constructores manuales por todos lados).
+
 ### A. Módulo de Base de Datos (`DatabaseModule.kt`)
+**Qué resuelve:** cómo se construye la única instancia de `AppDatabase` (`Room.databaseBuilder(...)`, marcada `@Singleton` para que sea una sola en toda la app) y cómo se obtienen el `ContactDao` y el `ContactLocalDataSource` a partir de ella. Sin este módulo, Hilt no sabría cómo crear un `AppDatabase` cuando alguna clase lo pide en su constructor.
 ```kotlin
 package com.rojas.consumodatos.di
 
@@ -337,6 +400,7 @@ object DatabaseModule {
 ```
 
 ### B. Módulo de Red (`NetworkModule.kt`)
+**Qué resuelve:** cómo se arma el cliente HTTP (`OkHttpClient`, con el interceptor de logging para ver las peticiones en el Logcat durante desarrollo) y cómo se construye el `Retrofit`/`ContactApiService` a partir de él (URL base, convertidor JSON). Centraliza en un solo lugar la configuración de red, en vez de repetirla cada vez que se necesita hacer una llamada HTTP.
 ```kotlin
 package com.rojas.consumodatos.di
 
@@ -385,6 +449,7 @@ object NetworkModule {
 ```
 
 ### C. Módulo de Repositorio (`RepositoryModule.kt`)
+**Qué resuelve:** la "conexión" entre la interfaz `ContactRepository` (de `domain`) y su implementación `ContactRepositoryImpl` (de `data`). Usa `@Binds` en vez de `@Provides` porque es una asociación directa interfaz→implementación (más eficiente para Hilt que construir el objeto manualmente). Gracias a este módulo, cuando el `ContactViewModel` pide un `ContactRepository` en su constructor, Hilt sabe que debe entregarle una instancia de `ContactRepositoryImpl` ya armada con sus propias dependencias (las fuentes de datos local y remota).
 ```kotlin
 package com.rojas.consumodatos.di
 
@@ -412,7 +477,10 @@ interface RepositoryModule {
 
 ## 📱 8. Paso 7: Capa de Presentación (`ui/contact`)
 
+Esta capa implementa **MVVM**: el `ContactViewModel` expone un único estado observable (`ContactUiState`) que la `ContactScreen` solo lee y dibuja; la pantalla nunca decide por su cuenta qué mostrar, solo reacciona al estado actual. Toda interacción del usuario (escribir un nombre, tocar "Guardar") se traduce en una llamada a una función del ViewModel, nunca en lógica dentro de la propia pantalla.
+
 ### A. Estado de la UI (`ContactUiState.kt`)
+**Por qué existe:** en vez de que la `Screen` maneje varias variables sueltas (lista, texto del input, si está cargando, si hay error), todo el estado visual se agrupa en **una sola clase inmutable**. Esto hace imposible que la UI quede en un estado inconsistente a medias, y hace trivial ver, de un vistazo, todo lo que la pantalla puede mostrar.
 ```kotlin
 package com.rojas.consumodatos.ui.contact
 
@@ -428,6 +496,10 @@ data class ContactUiState(
 ```
 
 ### B. ViewModel (`ContactViewModel.kt`)
+**Por qué existe y cómo interactúa:** el ViewModel es el puente entre la UI y el `ContactRepository`. En `init`/`observeContacts()` se suscribe al `Flow` del repositorio y, cada vez que Room emite una nueva lista, actualiza `_uiState` — eso es lo que hace que la lista en pantalla se refresque sola sin que nadie llame a un "refrescar" manual. `addContact()` y `deleteContact()` delegan en el repositorio y sobreviven a rotaciones de pantalla gracias a `viewModelScope`. `@HiltViewModel` le dice a Hilt que puede inyectar el `ContactRepository` automáticamente al construirlo.
+
+**Por qué `MutableStateFlow`/`StateFlow` separados:** `_uiState` (mutable, privado) es lo único que el ViewModel puede modificar; `uiState` (de solo lectura, público) es lo único que la `Screen` puede observar. Así se evita que la UI "tramposeé" y cambie el estado sin pasar por la lógica del ViewModel.
+
 ```kotlin
 package com.rojas.consumodatos.ui.contact
 
@@ -497,6 +569,8 @@ class ContactViewModel @Inject constructor(
 ```
 
 ### C. Vista en Jetpack Compose (`ContactScreen.kt`)
+**Por qué existe y cómo interactúa:** es la única clase que "sabe dibujar" la pantalla. Lee `uiState` con `collectAsStateWithLifecycle()` (que se desuscribe automáticamente cuando la pantalla no está visible, evitando fugas de memoria) y, por cada campo de `ContactUiState`, decide qué mostrar (carga, lista vacía, lista de contactos). Cada acción del usuario (`onValueChange`, `onClick`) llama directamente a una función del `viewModel` (`viewModel::onNameChanged`, `viewModel::addContact`) — la pantalla no contiene ninguna regla de negocio, solo layout y delegación.
+
 ```kotlin
 package com.rojas.consumodatos.ui.contact
 
@@ -603,7 +677,10 @@ fun ContactScreen(
 
 ## ⚡ 9. Paso 8: Inicialización y Punto de Entrada
 
+Estos tres archivos son el "cableado" final que hace que todo lo anterior cobre vida al abrir la app.
+
 ### A. Application (`ConsumoDatosApp.kt`)
+**Por qué existe:** Hilt necesita una clase `Application` anotada con `@HiltAndroidApp` para generar, en tiempo de compilación, el contenedor de dependencias raíz de toda la app (de donde salen las instancias `@Singleton` como `AppDatabase` o `ContactRepositoryImpl`). Sin esta clase, ningún `@Inject` ni `@HiltViewModel` del proyecto funcionaría.
 ```kotlin
 package com.rojas.consumodatos
 
@@ -615,6 +692,8 @@ class ConsumoDatosApp : Application()
 ```
 
 ### B. Manifest (`AndroidManifest.xml`)
+**Por qué existe:** el sistema operativo Android necesita saber, antes de arrancar cualquier pantalla, cuál es la clase `Application` de la app (`android:name=".ConsumoDatosApp"`). Si no se registra aquí, Android usaría la `Application` por defecto y el contenedor de Hilt nunca se crearía.
+
 Registra la clase `ConsumoDatosApp`:
 ```xml
 <application
@@ -624,6 +703,8 @@ Registra la clase `ConsumoDatosApp`:
 ```
 
 ### C. Activity (`MainActivity.kt`)
+**Por qué existe y cómo cierra el círculo:** es el punto de entrada visual: `@AndroidEntryPoint` habilita la inyección de Hilt dentro de la Activity (necesario para que `hiltViewModel()` funcione más abajo). `hiltViewModel()` le pide a Hilt un `ContactViewModel` ya construido con su `ContactRepository` inyectado, y ese ViewModel se lo pasa a `ContactScreen`. Con esto se cierra el círculo completo: `MainActivity` → crea/obtiene `ContactViewModel` → éste observa `ContactRepository` → que combina Room y Retrofit → y cualquier cambio en esa cadena termina re-dibujando `ContactScreen` automáticamente.
+
 ```kotlin
 package com.rojas.consumodatos
 
@@ -657,4 +738,76 @@ class MainActivity : ComponentActivity() {
         }
     }
 }
+```
+
+---
+
+## 🔗 10. Cómo interactúan todas las capas juntas
+
+Siguiendo el ejemplo de **agregar un contacto nuevo**, así recorre el sistema una sola acción del usuario, capa por capa:
+
+1. El usuario escribe en los campos y toca **"Guardar Contacto en Room"** en `ContactScreen`. Esto llama a `viewModel::addContact` — la Screen no sabe nada de Room ni de reglas de negocio, solo delega.
+2. `ContactViewModel.addContact()` valida que los campos no estén vacíos y llama a `repository.addContact(name, phone)`. El ViewModel no sabe si eso termina en SQLite, en un archivo o en la red: solo conoce la interfaz `ContactRepository`.
+3. `ContactRepositoryImpl.addContact()` construye un `Contact` (modelo de dominio), lo convierte a `ContactEntity` con el mapper (`toEntity()`) y se lo pasa a `ContactLocalDataSource.saveContact(...)`.
+4. `ContactLocalDataSourceImpl` delega en `ContactDao.insertContact(...)`, que es donde Room finalmente ejecuta el `INSERT` real en SQLite.
+5. Como `ContactDao.getAllContacts()` devuelve un `Flow`, Room emite automáticamente la lista actualizada apenas se confirma el `INSERT`, sin que nadie se lo pida explícitamente.
+6. `ContactViewModel`, que está coleccionando ese `Flow` desde `observeContacts()`, recibe la nueva lista y actualiza `_uiState`.
+7. `ContactScreen`, que observa `uiState` con `collectAsStateWithLifecycle()`, se recompone automáticamente y muestra el nuevo contacto en la `LazyColumn`.
+
+### Diagrama: del input a la base de datos (guardar)
+
+```mermaid
+sequenceDiagram
+    participant UI as ContactScreen
+    participant VM as ContactViewModel
+    participant Repo as ContactRepositoryImpl
+    participant DS as ContactLocalDataSource
+    participant DAO as ContactDao
+    participant DB as Room (SQLite)
+
+    UI->>VM: viewModel.addContact()<br/>(click "Guardar Contacto en Room")
+    VM->>Repo: addContact(name, phone)
+    Repo->>Repo: Contact → ContactEntity (mapper toEntity())
+    Repo->>DS: saveContact(entity)
+    DS->>DAO: insertContact(entity)
+    DAO->>DB: INSERT INTO contacts (...)
+    DB-->>DAO: fila insertada
+    Note over DB,VM: Room detecta el cambio en la tabla<br/>y vuelve a emitir el Flow de getAllContacts()
+    DB-->>VM: Flow<List<ContactEntity>> actualizado
+    VM->>VM: _uiState.update { contacts = nuevaLista }
+    VM-->>UI: uiState (StateFlow) recompone la pantalla
+```
+
+Todo esto ocurre sin que ninguna capa conozca los detalles internos de la siguiente: la Screen no sabe de Room, el ViewModel no sabe de SQL, el Repository no sabe de Compose. Hilt (`di`) es quien, al arrancar la app, conecta todas las implementaciones concretas detrás de cada interfaz para que esta cadena exista en tiempo de ejecución.
+
+El mismo patrón aplica para `syncRemoteContacts()`, solo que ahí el Repository primero llama a `ContactRemoteDataSource.fetchContacts()` (Retrofit → API) y guarda el resultado en `ContactLocalDataSource` — la UI sigue sin enterarse de que hubo una llamada de red: solo ve que, en algún momento, la tabla local cambió.
+
+### Diagrama: de la base de datos de vuelta a la UI (cargar/`getAll`)
+
+Este es el camino inverso: qué pasa cuando `ContactScreen` se abre por primera vez y necesita mostrar los contactos ya guardados.
+
+```mermaid
+sequenceDiagram
+    participant UI as ContactScreen
+    participant VM as ContactViewModel
+    participant Repo as ContactRepositoryImpl
+    participant DS as ContactLocalDataSource
+    participant DAO as ContactDao
+    participant DB as Room (SQLite)
+
+    Note over VM: init { observeContacts() }
+    VM->>Repo: repository.getContacts()
+    Repo->>DS: getContacts()
+    DS->>DAO: getAllContacts()
+    DAO->>DB: SELECT * FROM contacts ORDER BY name ASC
+    DB-->>DAO: Flow<List<ContactEntity>>
+    DAO-->>DS: Flow<List<ContactEntity>>
+    DS-->>Repo: Flow<List<ContactEntity>>
+    Repo->>Repo: map { it.toDomain() }<br/>(ContactEntity → Contact)
+    Repo-->>VM: Flow<List<Contact>>
+    VM->>VM: collect { _uiState.update { contacts = list } }
+    VM-->>UI: uiState (StateFlow) con la lista
+    UI->>UI: recomposición → LazyColumn dibuja los contactos
+
+    Note over DB,UI: Si la tabla cambia después (otro INSERT/DELETE),<br/>Room re-emite el Flow y los pasos 4-9 se repiten solos,<br/>sin que nadie vuelva a llamar getContacts() manualmente.
 ```
